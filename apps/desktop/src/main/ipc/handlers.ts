@@ -384,6 +384,8 @@ export function registerIPCHandlers(): void {
 
     // Otherwise cancel the running task
     if (taskManager.hasActiveTask(taskId)) {
+      // Clean up message batcher to prevent stale UI updates and memory leaks
+      flushAndCleanupBatcher(taskId);
       await taskManager.cancelTask(taskId);
       updateTaskStatus(taskId, 'cancelled', new Date().toISOString());
     }
