@@ -47,6 +47,24 @@ export interface LoggerOptions {
   maxFileSize?: number;
   /** Number of backup files to keep (default: 5) */
   maxBackups?: number;
+  /**
+   * Defer file logging initialization until first log.
+   * This is useful when the logger is created before app.whenReady(),
+   * as app.getPath('userData') may not be available yet.
+   */
+  deferInit?: boolean;
+  /**
+   * Number of log writes between rotation checks (default: 100).
+   * Higher values reduce fs.stat syscalls but may allow logs to grow
+   * slightly beyond maxFileSize before rotation.
+   */
+  rotationCheckInterval?: number;
+  /**
+   * Number of log messages to buffer before writing to file (default: 0 = no buffering).
+   * Buffering reduces file I/O by batching writes, improving performance at the cost
+   * of potential log loss if the process crashes before flushing.
+   */
+  bufferSize?: number;
 }
 
 /**
@@ -57,6 +75,9 @@ const DEFAULT_OPTIONS: Required<LoggerOptions> = {
   fileLogging: false,
   maxFileSize: 10 * 1024 * 1024, // 10MB
   maxBackups: 5,
+  deferInit: false,
+  rotationCheckInterval: 100, // Check every 100 log writes
+  bufferSize: 0, // No buffering by default (immediate writes)
 };
 
 /**
@@ -103,29 +124,46 @@ export class Logger {
   private options: Required<LoggerOptions>;
   private logFilePath: string | null = null;
   private logsDir: string | null = null;
+  private fileLoggingInitialized = false;
+  private logWriteCount = 0; // Counter for rotation check optimization
+  private logBuffer: string[] = []; // Buffer for batched writes
 
   constructor(moduleName: string, options: LoggerOptions = {}) {
     this.moduleName = moduleName;
     this.options = { ...DEFAULT_OPTIONS, ...options };
 
-    if (this.options.fileLogging) {
+    // Only initialize file logging immediately if not deferred
+    if (this.options.fileLogging && !this.options.deferInit) {
       this.initFileLogging();
     }
   }
 
   /**
    * Initialize file logging
+   * This is called lazily if deferInit is true, or immediately in constructor otherwise.
    */
   private initFileLogging(): void {
+    if (this.fileLoggingInitialized) return;
+
     try {
       this.logsDir = path.join(app.getPath('userData'), 'logs');
       if (!fs.existsSync(this.logsDir)) {
         fs.mkdirSync(this.logsDir, { recursive: true });
       }
       this.logFilePath = path.join(this.logsDir, 'app.log');
+      this.fileLoggingInitialized = true;
     } catch (error) {
       console.error('[Logger] Failed to initialize file logging:', error);
       this.options.fileLogging = false;
+    }
+  }
+
+  /**
+   * Ensure file logging is initialized (for deferred initialization)
+   */
+  private ensureFileLoggingInitialized(): void {
+    if (this.options.fileLogging && !this.fileLoggingInitialized) {
+      this.initFileLogging();
     }
   }
 
@@ -203,9 +241,14 @@ export class Logger {
     // Console output
     this.consoleLog(level, prefix, message, context);
 
-    // File output
-    if (this.options.fileLogging && this.logFilePath) {
-      this.fileLog(prefix, message, context);
+    // File output (with lazy initialization support)
+    if (this.options.fileLogging) {
+      // Trigger deferred initialization if needed
+      this.ensureFileLoggingInitialized();
+
+      if (this.logFilePath) {
+        this.fileLog(prefix, message, context);
+      }
     }
   }
 
@@ -245,20 +288,64 @@ export class Logger {
   private fileLog(prefix: string, message: string, context?: Record<string, unknown>): void {
     if (!this.logFilePath || !this.logsDir) return;
 
-    try {
-      // Check for log rotation
-      this.rotateIfNeeded();
+    // Format log entry
+    const contextStr = context ? ` ${safeStringify(context)}` : '';
+    const logEntry = `${prefix} ${message}${contextStr}\n`;
 
-      // Format log entry
-      const contextStr = context ? ` ${safeStringify(context)}` : '';
-      const logEntry = `${prefix} ${message}${contextStr}\n`;
+    // Use buffering if enabled
+    if (this.options.bufferSize > 0) {
+      this.logBuffer.push(logEntry);
+
+      // Flush buffer when it reaches the configured size
+      if (this.logBuffer.length >= this.options.bufferSize) {
+        this.flushBuffer();
+      }
+    } else {
+      // No buffering - write immediately
+      this.writeToFile(logEntry);
+    }
+  }
+
+  /**
+   * Write a log entry to file with rotation check
+   */
+  private writeToFile(content: string): void {
+    if (!this.logFilePath || !this.logsDir) return;
+
+    try {
+      // Increment write counter and check rotation periodically
+      this.logWriteCount++;
+      if (this.logWriteCount >= this.options.rotationCheckInterval) {
+        this.rotateIfNeeded();
+        this.logWriteCount = 0;
+      }
 
       // Append to log file
-      fs.appendFileSync(this.logFilePath, logEntry, 'utf8');
+      fs.appendFileSync(this.logFilePath, content, 'utf8');
     } catch (error) {
       // Fallback to console only
       console.error('[Logger] Failed to write to log file:', error);
     }
+  }
+
+  /**
+   * Flush the log buffer to file
+   */
+  private flushBuffer(): void {
+    if (this.logBuffer.length === 0) return;
+
+    // Join all buffered entries and write at once
+    const content = this.logBuffer.join('');
+    this.logBuffer = [];
+    this.writeToFile(content);
+  }
+
+  /**
+   * Manually flush any buffered log entries.
+   * Call this before process exit to ensure all logs are written.
+   */
+  flush(): void {
+    this.flushBuffer();
   }
 
   /**
@@ -314,6 +401,7 @@ export function getDefaultLogger(): Logger {
     defaultLogger = new Logger('app', {
       level: app.isPackaged ? LogLevel.INFO : LogLevel.DEBUG,
       fileLogging: app.isPackaged,
+      deferInit: true, // Defer file logging init until first log
     });
   }
   return defaultLogger;
@@ -338,11 +426,12 @@ const moduleLoggerCache: Map<string, Logger> = new Map();
 
 /**
  * Get or create a cached logger for a module
+ * Uses deferInit to avoid calling app.getPath before app is ready
  */
 function getCachedLogger(moduleName: string): Logger {
   let logger = moduleLoggerCache.get(moduleName);
   if (!logger) {
-    logger = new Logger(moduleName, { fileLogging: true });
+    logger = new Logger(moduleName, { fileLogging: true, deferInit: true });
     moduleLoggerCache.set(moduleName, logger);
   }
   return logger;
@@ -370,5 +459,21 @@ export function logEvent(entry: LogEntry): void {
       break;
     default:
       logger.info(entry.message, entry.context);
+  }
+}
+
+/**
+ * Flush all cached loggers' buffers.
+ * Call this before process exit to ensure all buffered logs are written.
+ */
+export function flushAllLoggers(): void {
+  // Flush default logger
+  if (defaultLogger) {
+    defaultLogger.flush();
+  }
+
+  // Flush all cached module loggers
+  for (const logger of moduleLoggerCache.values()) {
+    logger.flush();
   }
 }

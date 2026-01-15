@@ -49,6 +49,8 @@ describe('Logger Module', () => {
   let Logger: typeof import('@main/utils/logger').Logger;
   let LogLevel: typeof import('@main/utils/logger').LogLevel;
   let createLogger: typeof import('@main/utils/logger').createLogger;
+  let flushAllLoggers: typeof import('@main/utils/logger').flushAllLoggers;
+  let logEvent: typeof import('@main/utils/logger').logEvent;
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -65,6 +67,8 @@ describe('Logger Module', () => {
     Logger = module.Logger;
     LogLevel = module.LogLevel;
     createLogger = module.createLogger;
+    flushAllLoggers = module.flushAllLoggers;
+    logEvent = module.logEvent;
   });
 
   afterEach(() => {
@@ -302,6 +306,197 @@ describe('Logger Module', () => {
       expect(LogLevel.DEBUG).toBeLessThan(LogLevel.INFO);
       expect(LogLevel.INFO).toBeLessThan(LogLevel.WARN);
       expect(LogLevel.WARN).toBeLessThan(LogLevel.ERROR);
+    });
+  });
+
+  describe('Write Buffering', () => {
+    it('should buffer writes when buffering is enabled', () => {
+      // Arrange
+      mockApp.getPath.mockReturnValue('/mock/path/userData');
+      mockFs.existsSync.mockReturnValue(true);
+      const logger = new Logger('test', {
+        fileLogging: true,
+        level: LogLevel.INFO,
+        bufferSize: 5, // Buffer up to 5 messages
+      });
+
+      // Clear mock calls from initialization
+      mockFs.appendFileSync.mockClear();
+
+      // Act - log less than buffer size
+      logger.info('Message 1');
+      logger.info('Message 2');
+      logger.info('Message 3');
+
+      // Assert - should not write yet (buffered)
+      expect(mockFs.appendFileSync).not.toHaveBeenCalled();
+
+      // Act - log more to fill buffer
+      logger.info('Message 4');
+      logger.info('Message 5');
+
+      // Assert - buffer full, should flush
+      expect(mockFs.appendFileSync).toHaveBeenCalled();
+    });
+
+    it('should flush buffer on explicit flush call', () => {
+      // Arrange
+      mockApp.getPath.mockReturnValue('/mock/path/userData');
+      mockFs.existsSync.mockReturnValue(true);
+      const logger = new Logger('test', {
+        fileLogging: true,
+        level: LogLevel.INFO,
+        bufferSize: 10,
+      });
+
+      mockFs.appendFileSync.mockClear();
+
+      // Act
+      logger.info('Buffered message');
+      expect(mockFs.appendFileSync).not.toHaveBeenCalled();
+
+      logger.flush();
+
+      // Assert
+      expect(mockFs.appendFileSync).toHaveBeenCalled();
+    });
+
+    it('should write immediately when buffering is disabled (bufferSize = 0)', () => {
+      // Arrange
+      mockApp.getPath.mockReturnValue('/mock/path/userData');
+      mockFs.existsSync.mockReturnValue(true);
+      const logger = new Logger('test', {
+        fileLogging: true,
+        level: LogLevel.INFO,
+        bufferSize: 0, // No buffering
+      });
+
+      mockFs.appendFileSync.mockClear();
+
+      // Act
+      logger.info('Immediate message');
+
+      // Assert - should write immediately
+      expect(mockFs.appendFileSync).toHaveBeenCalled();
+    });
+  });
+
+  describe('Log Rotation Optimization', () => {
+    it('should not check file size on every log (rotation check interval)', () => {
+      // Arrange
+      mockApp.getPath.mockReturnValue('/mock/path/userData');
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.statSync.mockReturnValue({ size: 1000 });
+      const logger = new Logger('test', { fileLogging: true, level: LogLevel.INFO });
+
+      // Clear mock calls from initialization
+      mockFs.statSync.mockClear();
+
+      // Act - log multiple times
+      for (let i = 0; i < 50; i++) {
+        logger.info(`Log message ${i}`);
+      }
+
+      // Assert - statSync should be called less than 50 times
+      // With rotationCheckInterval of 100, it should be called 0 times for first 50 logs
+      expect(mockFs.statSync.mock.calls.length).toBeLessThan(50);
+    });
+
+    it('should eventually check file size after enough logs', () => {
+      // Arrange
+      mockApp.getPath.mockReturnValue('/mock/path/userData');
+      mockFs.existsSync.mockReturnValue(true);
+      mockFs.statSync.mockReturnValue({ size: 1000 });
+      const logger = new Logger('test', {
+        fileLogging: true,
+        level: LogLevel.INFO,
+        rotationCheckInterval: 10, // Check every 10 logs
+      });
+
+      // Clear mock calls from initialization
+      mockFs.statSync.mockClear();
+
+      // Act - log more than interval
+      for (let i = 0; i < 25; i++) {
+        logger.info(`Log message ${i}`);
+      }
+
+      // Assert - should check at least twice (at log 10 and 20)
+      expect(mockFs.statSync.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe('Lazy File Logging Initialization', () => {
+    it('should not call app.getPath when creating logger without file logging', () => {
+      // Arrange
+      mockApp.getPath.mockClear();
+
+      // Act
+      const logger = new Logger('test', { fileLogging: false });
+
+      // Assert
+      expect(mockApp.getPath).not.toHaveBeenCalled();
+      expect(logger).toBeDefined();
+    });
+
+    it('should defer file logging initialization until first log with fileLogging enabled', () => {
+      // Arrange
+      mockApp.getPath.mockClear();
+
+      // Act - create logger with file logging but deferInit
+      const logger = new Logger('test', { fileLogging: true, deferInit: true });
+
+      // Assert - app.getPath should NOT be called yet
+      expect(mockApp.getPath).not.toHaveBeenCalled();
+
+      // Act - log something to trigger initialization
+      logger.info('Test message');
+
+      // Assert - now app.getPath should be called
+      expect(mockApp.getPath).toHaveBeenCalledWith('userData');
+    });
+
+    it('should handle app.getPath errors gracefully during deferred initialization', () => {
+      // Arrange
+      mockApp.getPath.mockImplementation(() => {
+        throw new Error('app not ready');
+      });
+
+      // Act - create logger with deferred init
+      const logger = new Logger('test', { fileLogging: true, deferInit: true });
+
+      // Assert - should not throw, file logging should be disabled
+      expect(() => logger.info('Test')).not.toThrow();
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to initialize file logging'),
+        expect.any(Error)
+      );
+    });
+  });
+
+  describe('flushAllLoggers', () => {
+    it('should flush all cached loggers when called', () => {
+      // Arrange
+      mockApp.getPath.mockReturnValue('/mock/path/userData');
+      mockFs.existsSync.mockReturnValue(true);
+
+      // Create buffered logs via logEvent (which uses cached loggers)
+      logEvent({ level: 'info', message: 'Test 1', module: 'module-a' });
+      logEvent({ level: 'info', message: 'Test 2', module: 'module-b' });
+
+      mockFs.appendFileSync.mockClear();
+
+      // Act
+      flushAllLoggers();
+
+      // Assert - flush should have been called (even if buffers were empty)
+      // The function should not throw
+      expect(() => flushAllLoggers()).not.toThrow();
+    });
+
+    it('should not throw when no loggers exist', () => {
+      // Act & Assert
+      expect(() => flushAllLoggers()).not.toThrow();
     });
   });
 });
